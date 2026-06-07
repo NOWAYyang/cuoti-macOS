@@ -228,6 +228,75 @@ input[type="range"] {
   font-size: 14px;
 }
 
+.image-card {
+  background: #fff;
+  border-radius: 12px;
+  margin-bottom: 16px;
+  overflow: hidden;
+}
+
+.image-card:first-of-type {
+  margin-top: 12px;
+}
+
+.card-header {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1d1d1f;
+  padding: 12px 16px 0;
+}
+
+.crop-container {
+  height: 280px;
+  background: #f0f0f0;
+  margin: 8px;
+  border-radius: 8px;
+}
+
+.error-controls {
+  padding: 0 16px 12px;
+}
+
+.error-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+  color: #86868b;
+  margin-bottom: 8px;
+}
+
+.tag-btn {
+  padding: 5px 12px;
+  border: 1.5px solid #c7c7cc;
+  border-radius: 16px;
+  background: #fff;
+  color: #1d1d1f;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.tag-btn.selected {
+  background: #007aff;
+  border-color: #007aff;
+  color: #fff;
+}
+
+.error-note {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #d1d1d6;
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
+  resize: vertical;
+  box-sizing: border-box;
+}
+
 .hidden {
   display: none !important;
 }

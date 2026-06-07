@@ -5,11 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>错题本助手</title>
 <link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.1/cropper.min.css">
 </head>
 <body>
 <div class="container">
   <h1 class="title">错题本助手</h1>
-  <p class="subtitle">上传错题图片，自动生成可打印 PDF</p>
+  <p class="subtitle">上传错题图片，自动生成 Word 文档</p>
 
   <form id="upload-form">
     <div class="form-group">
@@ -56,7 +57,7 @@
     </div>
 
     <button type="submit" id="submit-btn" disabled>
-      生成错题本 PDF
+      生成错题本 Word
     </button>
   </form>
 
@@ -70,6 +71,7 @@
   </div>
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.1/cropper.min.js"></script>
 <script src="/static/script.js"></script>
 </body>
 </html>

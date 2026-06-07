@@ -4,12 +4,12 @@ import random
 import string
 import logging
 import subprocess
+import json
+import shutil
 from pathlib import Path
 
 from flask import Flask, render_template, request, send_file, jsonify
 from PIL import Image
-from weasyprint import HTML
-import markdown
 import requests
 
 from config import Config
@@ -22,6 +22,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
+
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+# 关掉 Flask 自带的 "Serving Flask app" 提示
+import flask.cli as _flask_cli
+_flask_cli.show_server_banner = lambda *_, **__: None
 
 for folder in [Config.UPLOAD_FOLDER, Config.OUTPUT_FOLDER, Config.MINERU_CACHE]:
     Path(folder).mkdir(exist_ok=True)
@@ -55,36 +61,103 @@ def compress_image(image_path: str, quality: int) -> str:
     return compressed_path
 
 
-def ocr_image(image_path: str) -> str:
-    cmd = [
-        "mineru",
-        "-p", image_path,
-        "-o", Config.MINERU_CACHE,
-        "--method", "auto",
-    ]
+# MinerU 常驻服务
+_mineru_api_url = None
+_mineru_server_proc = None
+
+
+def _start_mineru_server():
+    global _mineru_api_url, _mineru_server_proc
+    port = 52999
+    _mineru_api_url = f"http://127.0.0.1:{port}"
+
+    proc = subprocess.Popen(
+        ["/opt/anaconda3/bin/python", "-m", "mineru.cli.fast_api",
+         "--enable-vlm-preload", "true",
+         "--host", "127.0.0.1", "--port", str(port)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    _mineru_server_proc = proc
+
+    # 等它启动完毕
+    for _ in range(120):
+        import socket
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=1)
+            s.close()
+            return
+        except (ConnectionRefusedError, OSError):
+            time.sleep(1)
+
+    # 超时了，放弃
+    proc.kill()
+    _mineru_server_proc = None
+    _mineru_api_url = None
+
+
+def _stop_mineru_server():
+    global _mineru_server_proc, _mineru_api_url
+    if _mineru_server_proc:
+        _mineru_server_proc.kill()
+        _mineru_server_proc.wait(timeout=5)
+        _mineru_server_proc = None
+        _mineru_api_url = None
+
+
+def ocr_images(image_paths: list) -> dict:
+    """Send images to the persistent MinerU API server."""
+    if not image_paths or _mineru_api_url is None:
+        return {}
+
+    api = _mineru_api_url
+
+    # POST /tasks with all files
+    files = [("files", (os.path.basename(p), open(p, "rb"))) for p in image_paths]
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=Config.OCR_TIMEOUT,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            "MinerU 未安装或未找到。请运行: uv pip install -U 'mineru[core]'"
-        )
-    except subprocess.TimeoutExpired:
+        resp = requests.post(f"{api}/tasks", files=files,
+                             data={"backend": "vlm-auto-engine"}, timeout=30)
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError("OCR 服务未启动，请重启应用")
+    finally:
+        for _, fobj in files:
+            fobj[1].close()
+
+    if resp.status_code not in (200, 202):
+        raise RuntimeError(f"OCR 提交失败: HTTP {resp.status_code}")
+
+    task = resp.json()
+    task_id = task.get("task_id")
+    if not task_id:
+        raise RuntimeError("OCR 服务返回异常")
+
+    # 轮询直到完成
+    poll_interval = 1
+    for _ in range(Config.OCR_TIMEOUT):
+        time.sleep(poll_interval)
+        status_resp = requests.get(f"{api}/tasks/{task_id}", timeout=10)
+        if status_resp.status_code != 200:
+            continue
+        status = status_resp.json().get("status")
+        if status == "completed":
+            break
+        if status == "failed":
+            err = status_resp.json().get("error", "未知错误")
+            raise RuntimeError(f"OCR 处理失败: {err}")
+    else:
         raise RuntimeError(f"OCR 处理超时（{Config.OCR_TIMEOUT}秒）")
 
-    if result.returncode != 0:
-        raise RuntimeError(f"MinerU 执行失败: {result.stderr.strip()}")
+    # 获取结果
+    result_resp = requests.get(f"{api}/tasks/{task_id}/result", timeout=10)
+    if result_resp.status_code != 200:
+        raise RuntimeError("OCR 结果获取失败")
 
-    base = os.path.splitext(os.path.basename(image_path))[0]
-    md_path = os.path.join(Config.MINERU_CACHE, f"{base}.md")
-    if os.path.exists(md_path):
-        with open(md_path, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return ""
+    results = result_resp.json().get("results", {})
+    texts = {}
+    for p in image_paths:
+        base = os.path.splitext(os.path.basename(p))[0]
+        md = results.get(base, {}).get("md_content", "")
+        texts[p] = md.strip()
+    return texts
 
 
 def ask_deepseek(question: str) -> str:
@@ -97,11 +170,11 @@ def ask_deepseek(question: str) -> str:
         "messages": [
             {
                 "role": "system",
-                "content": "你是一位解题老师。请给出详细解题步骤和最终答案，用Markdown格式输出。",
+                "content": "你是一位解题老师。请给出详细解题步骤和最终答案，用Markdown格式输出。数学公式必须用标准LaTeX格式：行内公式用单个$包裹（如$x^2$），独立公式用双$包裹（如$$x=\\frac{-b}{2a}$$）。不要使用\\(和\\)或\\[和\\]。确保所有数学符号和表达式都用正确的LaTeX语法。",
             },
             {"role": "user", "content": f"请解答以下题目：\n\n{question}"},
         ],
-        "max_tokens": 2048,
+        "max_tokens": 4096,
         "temperature": 0.2,
     }
 
@@ -118,9 +191,14 @@ def ask_deepseek(question: str) -> str:
                     timeout=Config.DEEPSEEK_TIMEOUT,
                 )
                 if resp.status_code == 200:
-                    return resp.json()["choices"][0]["message"]["content"]
+                    msg = resp.json()["choices"][0]["message"]
+                    content = msg.get("content", "") or msg.get("reasoning_content", "")
+                    if content:
+                        return content
+                    last_error = "模型返回空内容"
+                    break  # try next model
                 elif resp.status_code == 401:
-                    return "*AI 解答失败：API Key 无效，请检查 DEEPSEEK_API_KEY*"
+                    return "*AI 解答失败：API Key 无效，请检查 api-key.txt 中的密钥是否正确*"
                 else:
                     last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
             except requests.exceptions.Timeout:
@@ -132,121 +210,168 @@ def ask_deepseek(question: str) -> str:
     return f"*AI 解答失败：{last_error}*"
 
 
-def generate_pdf(results: list, paper_size: str, margin_mm: int,
+def generate_docx(results: list, paper_size: str, margin_mm: int,
                  compress_quality: int, include_image: bool) -> str:
-    size = Config.PAPER_SIZES.get(paper_size, Config.PAPER_SIZES["A4"])
-    pages_html = ""
-    md = markdown.Markdown(extensions=["extra", "codehilite"])
+    """生成 .docx 文件。Markdown+LaTeX → pandoc → docx（含 Word 原生公式）"""
+    from docx import Document
+    from docx.shared import Pt, Cm, RGBColor
+    from docx.oxml import OxmlElement
 
+    _w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    qn = lambda tag: f"{{{_w}}}{tag}"
+
+    timestamp = int(time.time())
+    prefix = f"错题本_{timestamp}"
+    md_path = os.path.join(Config.OUTPUT_FOLDER, f"{prefix}.md")
+    docx_path = os.path.join(Config.OUTPUT_FOLDER, f"{prefix}.docx")
+
+    # 构建 Markdown
+    lines = []
     for i, item in enumerate(results):
-        question_html = md.convert(item["question"]) if item["question"] else "<p>（未能识别到题目文字）</p>"
-        answer_html = md.convert(item["answer"]) if item["answer"] else "<p>（无答案）</p>"
+        q_text = item.get("question") or "（未能识别到题目文字）"
+        a_text = item.get("answer") or "（无答案）"
 
-        img_tag = ""
-        if include_image and os.path.exists(item["compressed_path"]):
-            img_tag = f'<img src="file://{os.path.abspath(item["compressed_path"])}" class="problem-image" />'
+        lines.append(f"## 第 {i+1} 题\n\n")
+        if include_image and os.path.exists(item.get("compressed_path", "")):
+            lines.append(f"![题目图片]({os.path.abspath(item['compressed_path'])})\n\n")
 
-        pages_html += f"""
-        <div class="page">
-            <div class="page-header">错题本助手 - 第{i+1}题</div>
-            {img_tag}
-            <div class="section">
-                <h2>📖 题目原文</h2>
-                <div class="question-text">{question_html}</div>
-            </div>
-            <div class="section">
-                <h2>✅ 解题答案</h2>
-                <div class="answer-text">{answer_html}</div>
-            </div>
-            <div class="handwriting-area">
-                <div class="handwriting-label">✏️ 手写订正区</div>
-            </div>
-        </div>
-        """
+        lines.append("### 题目原文\n\n")
+        lines.append(f"{q_text}\n\n")
+        lines.append("### 解题答案\n\n")
+        lines.append(f"{a_text}\n\n")
 
-    html_template = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  @page {{
-    size: {size[0]}mm {size[1]}mm;
-    margin: {margin_mm}mm;
-  }}
-  body {{
-    font-family: -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
-    font-size: 12pt;
-    line-height: 1.6;
-    color: #222;
-  }}
-  .page {{
-    page-break-after: always;
-  }}
-  .page-header {{
-    font-size: 10pt;
-    color: #999;
-    text-align: center;
-    margin-bottom: 8mm;
-    border-bottom: 1px solid #ddd;
-    padding-bottom: 4mm;
-  }}
-  .problem-image {{
-    display: block;
-    max-width: 100%;
-    height: auto;
-    margin: 0 auto 6mm auto;
-  }}
-  .section {{
-    margin-bottom: 6mm;
-  }}
-  .section h2 {{
-    font-size: 13pt;
-    border-left: 4px solid #4a90d9;
-    padding-left: 4mm;
-    margin: 0 0 3mm 0;
-  }}
-  .question-text {{
-    background: #f8f9fa;
-    padding: 4mm;
-    border-radius: 2mm;
-    white-space: pre-wrap;
-  }}
-  .answer-text {{
-    padding: 4mm;
-  }}
-  .answer-text p {{
-    margin: 2mm 0;
-  }}
-  .handwriting-area {{
-    margin-top: 4mm;
-    min-height: 80mm;
-    background-image: repeating-linear-gradient(
-      transparent,
-      transparent 7.8mm,
-      #e0e0e0 7.8mm,
-      #e0e0e0 8mm
-    );
-    border-top: 2px dashed #ccc;
-    padding-top: 2mm;
-  }}
-  .handwriting-label {{
-    font-size: 10pt;
-    color: #aaa;
-    margin-bottom: 2mm;
-  }}
-</style>
-</head>
-<body>
-  {pages_html}
-</body>
-</html>"""
+        tags = item.get("error_tags", [])
+        note = item.get("error_note", "")
+        if tags or note:
+            lines.append("### 错因分析\n\n")
+            if tags:
+                lines.append(f"**错误标签：** {'、'.join(tags)}\n\n")
+            if note:
+                lines.append(f"**备注：** {note}\n\n")
 
-    output_path = os.path.join(
-        Config.OUTPUT_FOLDER,
-        f"错题本_{int(time.time())}.pdf",
-    )
-    HTML(string=html_template).write_pdf(output_path)
-    return output_path
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("".join(lines))
+
+    try:
+        subprocess.run(
+            ["pandoc", md_path, "-o", docx_path,
+             "-f", "markdown+tex_math_dollars",
+             "-t", "docx"],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"文档生成失败：{e.stderr}")
+    except FileNotFoundError:
+        raise RuntimeError("未找到 pandoc，请执行: brew install pandoc")
+    finally:
+        if os.path.exists(md_path):
+            os.unlink(md_path)
+
+    # Post-process: 每题末尾加手写区 + 分页
+    doc = Document(docx_path)
+    body = doc.element.body
+
+    def _make_p_elem(text="", font_size=None, color=None, bold=False):
+        """Create a w:p element with optional formatting."""
+        p = OxmlElement("w:p")
+        r = OxmlElement("w:r")
+        t = OxmlElement("w:t")
+        t.text = text
+        r.append(t)
+
+        if font_size or color or bold:
+            rPr = OxmlElement("w:rPr")
+            if font_size:
+                sz = OxmlElement("w:sz")
+                sz.set(qn("val"), str(font_size * 2))  # half-pt units
+                rPr.append(sz)
+            if color:
+                clr = OxmlElement("w:color")
+                clr.set(qn("val"), color.replace("#", ""))
+                rPr.append(clr)
+            if bold:
+                b = OxmlElement("w:b")
+                rPr.append(b)
+            r.insert(0, rPr)
+
+        p.append(r)
+        return p
+
+    def _make_handwriting_table():
+        """Create a w:tbl with 4 rows, each with dashed bottom border."""
+        tbl = OxmlElement("w:tbl")
+
+        # Table grid (1 column)
+        tblGrid = OxmlElement("w:tblGrid")
+        gridCol = OxmlElement("w:gridCol")
+        gridCol.set(qn("w"), "9072")
+        tblGrid.append(gridCol)
+        tbl.append(tblGrid)
+
+        for _ in range(4):
+            tr = OxmlElement("w:tr")
+            trPr = OxmlElement("w:trPr")
+            trHeight = OxmlElement("w:trHeight")
+            trHeight.set(qn("val"), "680")
+            trPr.append(trHeight)
+            tr.append(trPr)
+
+            tc = OxmlElement("w:tc")
+            tcPr = OxmlElement("w:tcPr")
+            tcW = OxmlElement("w:tcW")
+            tcW.set(qn("w"), "9072")
+            tcW.set(qn("type"), "dxa")
+            tcPr.append(tcW)
+
+            # Bottom border: dashed
+            tcBorders = OxmlElement("w:tcBorders")
+            bottom = OxmlElement("w:bottom")
+            for attr, val in [("val", "dashed"), ("color", "CCCCCC"),
+                              ("sz", "4"), ("space", "1")]:
+                bottom.set(qn(attr), val)
+            tcBorders.append(bottom)
+            tcPr.append(tcBorders)
+            tc.append(tcPr)
+
+            # Empty paragraph inside cell
+            tc.append(_make_p_elem())
+            tr.append(tc)
+            tbl.append(tr)
+
+        return tbl
+
+    # 找到所有 Heading 2（"## 第 N 题"）段落
+    heading2_paras = []
+    for para in doc.paragraphs:
+        if para.style.name == "Heading 2":
+            heading2_paras.append(para)
+
+    num_questions = len(heading2_paras)
+
+    # 从后往前处理（避免索引漂移）
+    for idx, para in enumerate(reversed(heading2_paras)):
+        actual_idx = num_questions - 1 - idx  # original index
+
+        # 除第一题外，在前一题末尾加手写区 → 再分页
+        if actual_idx > 0:
+            # 在当前 heading 前插入：手写区 table + label
+            tbl = _make_handwriting_table()
+            para._p.addprevious(tbl)
+            label_p = _make_p_elem("✏️ 手写订正区", font_size=10, color="AAAAAA")
+            para._p.addprevious(label_p)
+            para._p.addprevious(_make_p_elem(""))
+
+            # 分页 (set pageBreak on an empty paragraph)
+            pb_para = OxmlElement("w:p")
+            pb_r = OxmlElement("w:r")
+            pb_br = OxmlElement("w:br")
+            pb_br.set(qn("type"), "page")
+            pb_r.append(pb_br)
+            pb_para.append(pb_r)
+            para._p.addprevious(pb_para)
+
+    doc.save(docx_path)
+    return docx_path
 
 
 @app.route("/")
@@ -280,7 +405,8 @@ def upload():
     if paper_size not in Config.PAPER_SIZES:
         paper_size = Config.DEFAULT_PAPER_SIZE
 
-    results = []
+    saved_paths = []
+    compressed_paths = []
 
     try:
         for f in files:
@@ -288,30 +414,43 @@ def upload():
             save_name = random_filename(ext)
             save_path = os.path.join(Config.UPLOAD_FOLDER, save_name)
             f.save(save_path)
+            saved_paths.append(save_path)
 
-            compressed_path = compress_image(save_path, compress_quality)
+        # 压缩所有图片（先）
+        for sp in saved_paths:
+            compressed_paths.append(compress_image(sp, compress_quality))
 
-            question_text = ocr_image(save_path) or "（未能识别到题目文字）"
+        # OCR 所有图片（一次 batch 调用，模型只加载一次）
+        ocr_results = ocr_images(compressed_paths)
 
+        error_data_raw = request.form.get("error_data", "{}")
+        try:
+            error_data = json.loads(error_data_raw)
+        except json.JSONDecodeError:
+            error_data = {}
+        all_tags = error_data.get("tags", [])
+        all_notes = error_data.get("notes", [])
+
+        results = []
+        for i, cp in enumerate(compressed_paths):
+            question_text = ocr_results.get(cp, "") or "（未能识别到题目文字）"
             answer = ask_deepseek(question_text)
-
             results.append({
                 "question": question_text,
                 "answer": answer,
-                "compressed_path": compressed_path,
+                "compressed_path": cp,
+                "error_tags": all_tags[i] if i < len(all_tags) else [],
+                "error_note": all_notes[i] if i < len(all_notes) else "",
             })
 
-            if compressed_path != save_path:
-                os.remove(save_path)
-
-        pdf_path = generate_pdf(
+        docx_path = generate_docx(
             results, paper_size, margin_mm, compress_quality, include_image,
         )
 
         elapsed = time.time() - start_time
-        logging.info(f"OK | {ip} | {len(files)} images | {elapsed:.1f}s | {pdf_path}")
+        logging.info(f"OK | {ip} | {len(files)} images | {elapsed:.1f}s | {docx_path}")
 
-        return send_file(pdf_path, as_attachment=True, download_name=os.path.basename(pdf_path))
+        return send_file(docx_path, as_attachment=True, download_name=os.path.basename(docx_path))
 
     except RuntimeError as e:
         logging.error(f"ERR | {ip} | {e}")
@@ -321,6 +460,63 @@ def upload():
         return jsonify({"error": f"处理失败：{str(e)}"}), 500
 
 
+def _get_local_ip() -> str:
+    import subprocess
+    # 优先扫 Mac 常见的 Wi-Fi / 有线网卡（en0, en1）
+    for iface in ("en0", "en1"):
+        try:
+            ip = subprocess.run(
+                ["ipconfig", "getifaddr", iface],
+                capture_output=True, text=True, timeout=2,
+            ).stdout.strip()
+            if ip:
+                return ip
+        except Exception:
+            continue
+
+    # 兜底：扫所有网卡，跳过 lo0 和 Docker 隧道
+    try:
+        out = subprocess.run(
+            ["ifconfig"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        cur = ""
+        for line in out.splitlines():
+            if line and line[0].isalpha():
+                cur = line.split(":")[0]
+            if "inet " in line and cur not in ("lo0", "lo", "utun84", "utun"):
+                parts = line.strip().split()
+                idx = parts.index("inet") + 1
+                if idx < len(parts):
+                    ip = parts[idx]
+                    if not ip.startswith("127."):
+                        return ip
+    except Exception:
+        pass
+
+    return "127.0.0.1"
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    ip = _get_local_ip()
+
+    print("正在启动 OCR 模型（首次约 90 秒）...")
+    _start_mineru_server()
+    print("OCR 模型加载完成 ✓")
+
+    print(f"""
+━━━ 错题本助手 已启动 🚀 ━━━
+
+  ➜ 手机访问（同一 Wi-Fi）
+     http://{ip}:{port}
+
+  ➜ 本机访问
+     http://127.0.0.1:{port}
+
+  Ctrl+C 停止服务
+""")
+    try:
+        app.run(host="0.0.0.0", port=port)
+    finally:
+        _stop_mineru_server()

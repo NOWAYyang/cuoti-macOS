@@ -1,10 +1,39 @@
-api-key.txt
-.env
-venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment & secrets
+.env
+api-key.txt
+
+# Logs
+*.log
+
+# Project data
 uploads/
+output/
 outputs/
 mineru_cache/
-app.log
-.DS_Store
+backup/
+.claude
