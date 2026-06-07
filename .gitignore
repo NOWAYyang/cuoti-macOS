@@ -1,0 +1,10 @@
+api-key.txt
+.env
+venv/
+__pycache__/
+*.pyc
+uploads/
+outputs/
+mineru_cache/
+app.log
+.DS_Store

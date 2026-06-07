@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>错题本助手</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="container">
+  <h1 class="title">错题本助手</h1>
+  <p class="subtitle">上传错题图片，自动生成可打印 PDF</p>
+
+  <form id="upload-form">
+    <div class="form-group">
+      <label class="file-label">
+        <span>选择错题图片</span>
+        <input type="file" name="images" id="image-input"
+               multiple accept="image/*" capture="environment" required>
+      </label>
+      <div id="file-preview"></div>
+    </div>
+
+    <div class="form-group">
+      <label for="paper_size">纸张尺寸</label>
+      <select name="paper_size" id="paper_size">
+        <option value="A4" selected>A4 (210×297mm)</option>
+        <option value="B5">B5 (176×250mm)</option>
+        <option value="Letter">Letter (215.9×279.4mm)</option>
+      </select>
+    </div>
+
+    <div class="form-group">
+      <label for="compress_quality">图片压缩质量: <span id="quality-value">80</span>%</label>
+      <input type="range" name="compress_quality" id="compress_quality"
+             min="30" max="100" value="80" step="1">
+      <div class="range-labels">
+        <span>模糊</span>
+        <span>清晰</span>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label for="margin_mm">留白边距（毫米）</label>
+      <input type="number" name="margin_mm" id="margin_mm"
+             value="10" min="0" max="50" step="1">
+    </div>
+
+    <div class="form-group toggle-group">
+      <label for="include_original_image">包含原图</label>
+      <label class="toggle">
+        <input type="checkbox" name="include_original_image"
+               id="include_original_image" checked>
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+
+    <button type="submit" id="submit-btn" disabled>
+      生成错题本 PDF
+    </button>
+  </form>
+
+  <div id="loading" class="hidden">
+    <div class="spinner"></div>
+    <p id="status-text">正在 OCR 提取...</p>
+  </div>
+
+  <div id="error" class="hidden">
+    <p id="error-text"></p>
+  </div>
+</div>
+
+<script src="/static/script.js"></script>
+</body>
+</html>
